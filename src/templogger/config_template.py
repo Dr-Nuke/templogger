@@ -67,7 +67,6 @@ ADAPTERS = [
 class Sensor:
     id: int
     mac: str
-    type: str
     name: str
 
 

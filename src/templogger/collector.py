@@ -12,14 +12,10 @@ from loguru import logger
 
 from config import CHARACTERISTICS, ADAPTERS, SENSORS, MAX_NAME_LENGTH, MAX_CHAR_LENGTH, SENSOR_TIMEOUT, MAX_RETRIES, \
     Sensor, OS, DATA_DIR_SHT, ROOT
-from utils import sensor_data_logging
+from utils import sensor_data_logging, timestamp_now
 
 
 # === Helpers ===
-def timestamp_now():
-    return datetime.datetime.now().replace(microsecond=0)
-
-
 def padded_name(s):
     return s.ljust(MAX_NAME_LENGTH)
 
@@ -170,7 +166,7 @@ if __name__ == "__main__":
                     
     parser.add_argument("-s",
                         "--source",
-                        help="adds information on who runs the script. appears in the logging",
+                        help="adds information on who runs the script, i.e. 'cronjob'. appears in the logging",
                         type=str,
                         default=None)
 
