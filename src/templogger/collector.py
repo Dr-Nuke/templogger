@@ -1,18 +1,22 @@
+import argparse
 import asyncio
 import datetime
-import sys
-import argparse
-from statistics import mean
-from typing import Dict, Any, Optional
 import getpass
+import sys
+from statistics import mean
+from typing import Any, Dict, Optional
+
 import pandas as pd
 from bleak import BleakClient
 from bleak.exc import BleakDeviceNotFoundError
 from loguru import logger
 
-from config import CHARACTERISTICS, ADAPTERS, SENSORS, MAX_NAME_LENGTH, MAX_CHAR_LENGTH, SENSOR_TIMEOUT, MAX_RETRIES, \
-    Sensor, OS, DATA_DIR_SHT, ROOT
-from utils import sensor_data_logging, timestamp_now
+from templogger.config import (ADAPTERS, CHARACTERISTICS, DATA_DIR_SHT,
+                               MAX_CHAR_LENGTH, MAX_NAME_LENGTH, MAX_RETRIES,
+                               OS, ROOT, SENSOR_TIMEOUT, SENSORS_SHT, Sensor)
+from templogger.utils import (df_prep_for_redis, get_redis,
+                              push_raw_sht_data_redis, sensor_data_logging,
+                              timestamp_now)
 
 
 # === Helpers ===
@@ -35,11 +39,13 @@ async def read_characteristics(client: BleakClient, sensor: Sensor) -> Dict[str,
         try:
             raw = await client.read_gatt_char(uuid)
             value = decoder(raw)
-            logger.info(f"[{padded_name(name)}] {padded_char(char_name)}: {value}")
+            logger.info(
+                f"[{padded_name(name)}] {padded_char(char_name)}: {value}")
             sensor_data[char_name] = value
             successes.append(True)
         except Exception as e:
-            logger.warning(f"[{padded_name(name)}] Failed to read {char_name}: {e}")
+            logger.warning(
+                f"[{padded_name(name)}] Failed to read {char_name}: {e}")
             errors.append(e)
             successes.append(False)
     return all(successes), sensor_data, errors
@@ -61,7 +67,8 @@ class SensorTask:
 
     async def run(self, adapter: str):
         self.attempt += 1
-        logger.info(f"[{padded_name(self.name)}] Attempt {self.attempt}/{MAX_RETRIES} via {adapter}, connecting...")
+        logger.info(
+            f"[{padded_name(self.name)}] Attempt {self.attempt}/{MAX_RETRIES} via {adapter}, connecting...")
         try:
             start = timestamp_now()
             if OS == "linux":
@@ -71,15 +78,18 @@ class SensorTask:
             try:
                 await asyncio.wait_for(client.connect(timeout=SENSOR_TIMEOUT), timeout=SENSOR_TIMEOUT + 1)
             except asyncio.TimeoutError as e:
-                logger.error(f"[{padded_name(self.name)}] BLE connection timed out after {SENSOR_TIMEOUT}s.")
+                logger.error(
+                    f"[{padded_name(self.name)}] BLE connection timed out after {SENSOR_TIMEOUT}s.")
                 self.errors.append(e)
             if client.is_connected:
-                logger.info(f"[{padded_name(self.name)}] Connected via {adapter}.")
+                logger.info(
+                    f"[{padded_name(self.name)}] Connected via {adapter}.")
                 success, result, errors = await read_characteristics(client, self.sensor)
                 if success:
                     self.success = True
                     self.timestamp = timestamp_now()
-                    self.duration = round((timestamp_now() - start).total_seconds(), 1)
+                    self.duration = round(
+                        (timestamp_now() - start).total_seconds(), 1)
                     self.result = result
                 else:
                     [self.errors.append(e) for e in errors]
@@ -88,7 +98,8 @@ class SensorTask:
         except BleakDeviceNotFoundError as e:
             self.last_error = str(e)
             self.errors.append(e)
-            logger.error(f"[{padded_name(self.name)}] Failed at attempt {self.attempt} via {adapter}: {e}")
+            logger.error(
+                f"[{padded_name(self.name)}] Failed at attempt {self.attempt} via {adapter}: {e}")
             await asyncio.sleep(1)  # brief pause before retry
         except Exception as e:
             exc_type, exc_obj, exc_tb = sys.exc_info()
@@ -117,12 +128,13 @@ async def worker(queue: asyncio.Queue, adapter: str):
 # === MAIN EXECUTION ===
 async def main() -> Dict[str, Dict[str, Any]]:
     queue = asyncio.Queue()
-    task_list = [SensorTask(sensor) for sensor in SENSORS]
+    task_list = [SensorTask(sensor) for sensor in SENSORS_SHT]
 
     for task in task_list:
         await queue.put(task)
 
-    workers = [asyncio.create_task(worker(queue, adapter)) for adapter in ADAPTERS]
+    workers = [asyncio.create_task(worker(queue, adapter))
+               for adapter in ADAPTERS]
     await queue.join()
 
     for w in workers:
@@ -144,13 +156,14 @@ async def main() -> Dict[str, Dict[str, Any]]:
     logger.info("\n--- Final Results ---")
     for name, result in results.items():
         status = "✅ Success" if result["success"] else "❌ Failed"
-        logger.info(f"{padded_name(name)}: {status} after {result['attempts']} attempt(s)")
+        logger.info(
+            f"{padded_name(name)}: {status} after {result['attempts']} attempt(s)")
 
     return results
 
 
-def prep_data_for_csv(data):
-    df = pd.DataFrame.from_dict(sensor_result)
+def prep_data_for_csv(data, timestamp):
+    df = pd.DataFrame.from_dict(data)
     df = df.transpose().reset_index()
     df["time"] = timestamp
     df = df.join(pd.json_normalize(df['data']), how="inner")
@@ -163,7 +176,7 @@ def prep_data_for_csv(data):
 if __name__ == "__main__":
     # get args
     parser = argparse.ArgumentParser()
-                    
+
     parser.add_argument("-s",
                         "--source",
                         help="adds information on who runs the script, i.e. 'cronjob'. appears in the logging",
@@ -173,23 +186,26 @@ if __name__ == "__main__":
     args = parser.parse_args()
     source = args.source
     if source is not None:
-        logger.info(f"running sht sensors by '{getpass.getuser()}' from '{source}' from '{ROOT}' with '{sys.executable}'")
-        
+        logger.info(
+            f"running sht sensors by '{getpass.getuser()}' from '{source}' from '{ROOT}' with '{sys.executable}'")
+
     timestamp = timestamp_now()
     sensor_result = asyncio.run(main())
 
     # results & analytics
     for name, result in sensor_result.items():
-        print(padded_name(name), result)
+        logger.info(f"{padded_name(name)}: r{result}")
     script_time = round((timestamp_now() - timestamp).total_seconds() / 60, 2)
-    logger.info(f"reading {len(SENSORS)} sensors took {script_time} minutes")
+    logger.info(f"reading {len(SENSORS_SHT)} sensors took {script_time} minutes")
 
-    sensor_durations = [r["duration"] for r in sensor_result.values() if r["duration"]]
-    if sensor_durations:
-        logger.info(f"sensor durations mean: {round(mean(sensor_durations), 2)}, values are {sensor_durations}")
+    # sensor_durations = [r["duration"] for r in sensor_result.values() if r["duration"]]
+    # if sensor_durations:
+    #     logger.info(f"sensor durations mean: {round(mean(sensor_durations), 2)}, values are {sensor_durations}")
 
-
-    df = prep_data_for_csv(sensor_result)
+    df = prep_data_for_csv(sensor_result, timestamp)
     sensor_data_logging(df, "sht", DATA_DIR_SHT, timestamp)
 
-    logger.info("end")
+    r = get_redis()
+    df = df_prep_for_redis(df)
+    push_raw_sht_data_redis(r, df)
+    logger.info("done getting sht sensor data")

@@ -5,6 +5,7 @@ Quick start:
 * rename config_template to config
 * in there, add your sensors with MACS and Names
 * adjust the list of bluetooth adapters
+* run the [Redis Stack Docker Container](https://hub.docker.com/r/redis/redis-stack)
 
 generic vscode run config:
        

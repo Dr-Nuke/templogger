@@ -200,3 +200,6 @@ notebooks/
 ..gitignore.swp
 setup_venv.sh
 data/
+sample_results
+src/templogger/old/
+
