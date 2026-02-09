@@ -6,9 +6,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pytz
 import redis
 import seaborn as sns
+
 
 from templogger.config import (AGGREGATIONS, DATA_DIR_CO2, DATA_DIR_SHT,
                                METRICS_CO2, METRICS_SHT,

@@ -209,3 +209,4 @@ if __name__ == "__main__":
     df = df_prep_for_redis(df)
     push_raw_sht_data_redis(r, df)
     logger.info("done getting sht sensor data")
+    

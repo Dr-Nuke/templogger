@@ -18,13 +18,13 @@ class Co2_Sensor:
     # a class to handle the sensor handling etc
     def __init__(self, location, device):
         self.s = serial.Serial(device, baudrate=9600, timeout=.5)
-        logger.info(f"initiated sensor '{self.s.name}'")
         self.s.flushInput()
         self.data_dir = DATA_DIR_CO2
         self.now = None
         self.errors = []
         self.df = None
         self.location = location
+        logger.info(f"initiated sensor '{self.s.name}' with location '{self.location}'")
 
     def read_sensor(self):
         self.s.flushInput()
@@ -39,7 +39,7 @@ class Co2_Sensor:
         try:
             self.read_sensor()
         except Exception as E:
-            logger.error(f'sensor {self.s.location} had {type(E)}')
+            logger.error(f'sensor {self.location} had {type(E)}')
             self.co2 = None
             self.errors.append(type(E))
 
