@@ -138,6 +138,19 @@ SENSOR_TYPES = {
     },
 }
 
+# Derived metrics — computed from raw sensor data, stored as time series in Redis
+DERIVED_METRICS = [
+    {
+        "name": "TempDelta",
+        "label": "Temp In-Out",
+        "unit": "°C",
+        "indoor_sensors": ["Room1"],
+        "outdoor_sensors": ["Room2"],
+        "source_metric": "Temperature",
+        "func": "indoor_outdoor_delta",
+    },
+]
+
 # notification configs
 NTFY_CONFIG = {
     "ntfy_topic": "your-ntfy-topic-here",

@@ -10,8 +10,9 @@ import redis
 from dash import Dash, Input, Output, dcc, html
 from dash.exceptions import PreventUpdate
 
-from templogger.config import (AGGREGATIONS, METRICS_CO2, METRICS_PLOT,
-                               METRICS_SHT, REDIS_LAST_TEIMESTAMP_KEY, SENSORS_SHT,
+from templogger.config import (AGGREGATIONS, DERIVED_METRICS, METRICS_CO2,
+                               METRICS_PLOT, METRICS_SHT,
+                               REDIS_LAST_TEIMESTAMP_KEY, SENSORS_SHT,
                                SENSORS_CO2, logger)
 from templogger.utils import make_key, ms_to_pandas_dt
 
@@ -138,7 +139,10 @@ def register_callbacks(app: Dash) -> None:
         Output(f"graph-{metric}-{agg}", "figure")
         for metric in METRICS_PLOT
         for agg, _ in AGGREGATIONS.items()
-
+    ] + [
+        Output(f"graph-{dm['name']}-{agg}", "figure")
+        for dm in DERIVED_METRICS
+        for agg in AGGREGATIONS
     ]
 
     @app.callback(output_ids, Input('interval-component', 'n_intervals'))
@@ -167,7 +171,7 @@ def register_callbacks(app: Dash) -> None:
                     }
                 }
                 # todo: make function from below if clause
-                if agg == "raw":  # add night times
+                if agg in ("raw", "hourly"):  # add night times
                     # Gather all datetime and y values for night shading and y-range determination
                     all_datetimes = []
                     all_y = []
@@ -204,8 +208,69 @@ def register_callbacks(app: Dash) -> None:
 
                 figures.append(fig)
 
+        # derived metrics — raw only, empty figures for hourly/daily
+        for dm in DERIVED_METRICS:
+            for agg in AGGREGATIONS:
+                if agg == "raw":
+                    key = make_key("derived", dm["name"], "raw")
+                    df = fetch_series_data(key)
+                    if not df.empty:
+                        lines = [{
+                            "x": df["datetime"],
+                            "y": df["value"],
+                            "type": "line",
+                            "name": dm["label"],
+                        }]
+                    else:
+                        lines = []
+                    fig = {
+                        "data": lines,
+                        "layout": {
+                            "title": f"{dm['label']} ({agg})",
+                            "xaxis": {"title": "Time"},
+                            "yaxis": {"title": dm.get("unit", "")},
+                            "margin": {"l": 30, "r": 10, "t": 30, "b": 30},
+                            "height": 250,
+                            "showlegend": True,
+                        }
+                    }
+                    # night shading
+                    if lines:
+                        all_datetimes = list(df["datetime"])
+                        all_y = list(df["value"])
+                        if all_datetimes:
+                            x_max = max(all_datetimes)
+                            y_min = min(all_y)
+                            y_max = max(all_y)
+                            night_periods = get_night_periods(all_datetimes)
+                            shapes = []
+                            for start, end in night_periods:
+                                clipped_end = min(end, x_max)
+                                if start < clipped_end:
+                                    shapes.append({
+                                        "type": "rect",
+                                        "xref": "x", "yref": "y",
+                                        "x0": start, "x1": clipped_end,
+                                        "y0": y_min, "y1": y_max,
+                                        "fillcolor": "gray", "opacity": 0.1,
+                                        "line": {"width": 0}, "layer": "below"
+                                    })
+                            fig["layout"]["shapes"] = shapes
+                else:
+                    fig = {
+                        "data": [],
+                        "layout": {
+                            "title": f"{dm['label']} ({agg})",
+                            "xaxis": {"title": "Time"},
+                            "margin": {"l": 30, "r": 10, "t": 30, "b": 30},
+                            "height": 250,
+                        }
+                    }
+                figures.append(fig)
+
         logger.info(f"Graph update {n} took {time.time() - start_logging:.2f}s")
         return figures
+
 
 
 def serve_layout() -> html.Div:
@@ -266,17 +331,34 @@ def serve_layout() -> html.Div:
         )
         rows.append(row)
 
-    # Placeholder row
-    placeholder_row = html.Div(
-        children=[
-            dcc.Graph(
-                id=f"graph-placeholder-{i}", style={"display": "inline-block", "width": graph_width})
-            for i in range(len(AGGREGATIONS))
-        ],
-        style={"display": "flex", "justifyContent": "space-between",
-               "marginBottom": "20px"}
-    )
-    rows.append(placeholder_row)
+    # Derived metrics rows
+    for dm in DERIVED_METRICS:
+        row = html.Div(
+            children=[
+                html.Div(
+                    dm["label"],
+                    style={
+                        "width": label_width,
+                        "writingMode": "vertical-rl",
+                        "transform": "rotate(180deg)",
+                        "fontWeight": "800",
+                        "fontSize": "20px",
+                        "display": "flex",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "userSelect": "none",
+                    },
+                )
+            ] + [
+                dcc.Graph(
+                    id=f"graph-{dm['name']}-{agg}",
+                    style={"display": "inline-block", "width": graph_width})
+                for agg in AGGREGATIONS
+            ],
+            style={"display": "flex", "justifyContent": "space-between",
+                   "marginBottom": "20px"}
+        )
+        rows.append(row)
 
     return html.Div([
         *rows,

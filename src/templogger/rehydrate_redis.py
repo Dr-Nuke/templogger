@@ -11,7 +11,7 @@ import seaborn as sns
 
 
 from templogger.config import (AGGREGATIONS, DATA_DIR_CO2, DATA_DIR_SHT,
-                               METRICS_CO2, METRICS_SHT,
+                               DERIVED_METRICS, METRICS_CO2, METRICS_SHT,
                                REDIS_LAST_TEIMESTAMP_KEY, SENSORS_CO2,
                                SENSORS_SHT, SENSOR_TYPES, logger)
 from templogger.utils import (compute_aggregates, df_prep_for_redis,
@@ -60,6 +60,22 @@ def create_schema(r):
                         raise
                     logger.info(f"key {key} already exists - skipping")
                     counter_ignore += 1
+
+    for dm in DERIVED_METRICS:
+        key = make_key("derived", dm["name"], "raw")
+        try:
+            r.ts().create(
+                key,
+                retention_msecs=AGGREGATIONS["raw"]["retention"],
+                duplicate_policy="LAST",
+            )
+            logger.info(f"created key {key}")
+            counter_success += 1
+        except redis.ResponseError as e:
+            if "TSDB: key already exists" not in str(e):
+                raise
+            logger.info(f"key {key} already exists - skipping")
+            counter_ignore += 1
 
     try:
         r.set(REDIS_LAST_TEIMESTAMP_KEY, 0)
@@ -196,6 +212,72 @@ def marker_backfill(r, sensor_type):
                     f"wrote {len(df_agg)} records ({start_date} to {end_date})")
 
 
+def recompute_derived(r):
+    """Recompute all derived metrics from raw data in Redis."""
+    from templogger.derived import FUNC_REGISTRY
+
+    ts = r.ts()
+    for metric_def in DERIVED_METRICS:
+        func_name = metric_def["func"]
+        func = FUNC_REGISTRY.get(func_name)
+        if func is None:
+            logger.warning(f"unknown derived func: {func_name}")
+            continue
+
+        name = metric_def["name"]
+        source_metric = metric_def["source_metric"]
+        all_sensors = metric_def["indoor_sensors"] + metric_def["outdoor_sensors"]
+
+        # fetch full time series for each involved sensor
+        sensor_data = {}
+        for sensor in all_sensors:
+            key = make_key(sensor, source_metric, "raw")
+            try:
+                data = ts.range(key, "-", "+")
+                sensor_data[sensor] = {int(t): v for t, v in data}
+            except redis.ResponseError:
+                sensor_data[sensor] = {}
+
+        # collect all timestamps from indoor sensors
+        all_timestamps = set()
+        for sensor in metric_def["indoor_sensors"]:
+            all_timestamps.update(sensor_data.get(sensor, {}).keys())
+
+        if not all_timestamps:
+            logger.info(f"no raw data for derived metric {name}")
+            continue
+
+        derived_key = make_key("derived", name, "raw")
+        count = 0
+        for timestamp_ms in sorted(all_timestamps):
+            indoor_values = [
+                sensor_data[s][timestamp_ms]
+                for s in metric_def["indoor_sensors"]
+                if timestamp_ms in sensor_data.get(s, {})
+            ]
+            outdoor_values = [
+                sensor_data[s][timestamp_ms]
+                for s in metric_def["outdoor_sensors"]
+                if timestamp_ms in sensor_data.get(s, {})
+            ]
+
+            if not indoor_values or not outdoor_values:
+                continue
+
+            indoor_mean = sum(indoor_values) / len(indoor_values)
+            outdoor_val = min(outdoor_values)
+            delta = round(indoor_mean - outdoor_val, 2)
+
+            try:
+                ts.add(derived_key, timestamp_ms, float(delta))
+                count += 1
+            except redis.ResponseError as e:
+                if "TSDB: Timestamp is older than retention" not in str(e):
+                    raise
+
+        logger.info(f"recomputed {count} derived {name} values")
+
+
 if __name__ == "__main__":
     logger.info(f"starting redis rehydration")
     r = get_redis()
@@ -220,5 +302,8 @@ if __name__ == "__main__":
     # Step 3: marker-based backfill for gaps
     for type_name, sensor_type in SENSOR_TYPES.items():
         marker_backfill(r, sensor_type)
+
+    # Step 4: recompute derived metrics from raw data
+    recompute_derived(r)
 
     logger.info("rehydration complete")
