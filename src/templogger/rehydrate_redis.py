@@ -13,10 +13,12 @@ import seaborn as sns
 from templogger.config import (AGGREGATIONS, DATA_DIR_CO2, DATA_DIR_SHT,
                                METRICS_CO2, METRICS_SHT,
                                REDIS_LAST_TEIMESTAMP_KEY, SENSORS_CO2,
-                               SENSORS_SHT, logger)
-from templogger.utils import (df_prep_for_redis, get_redis, make_key,
+                               SENSORS_SHT, SENSOR_TYPES, logger)
+from templogger.utils import (compute_aggregates, df_prep_for_redis,
+                              get_last_aggregated_time, get_redis,
+                              load_raw_csvs, make_key, push_aggregate_redis,
                               push_raw_co2_data_redis, push_raw_sht_data_redis,
-                              timestamp_now)
+                              timestamp_now, write_aggregate_csv)
 
 
 def create_schema(r):
@@ -91,6 +93,109 @@ def ingest_raw(r, data_dir, prefix):
     return df
 
 
+def ingest_aggregate_csvs(r, sensor_type, agg_level):
+    """Load aggregate CSV files within the retention window and push to Redis."""
+    retention_ms = AGGREGATIONS[agg_level]["retention"]
+    retention_td = datetime.timedelta(milliseconds=retention_ms)
+    cutoff_date = (timestamp_now() - retention_td).date()
+
+    agg_dir = sensor_type["hourly_dir"] if agg_level == "hourly" else sensor_type["daily_dir"]
+    prefix = sensor_type["prefix"]
+    metrics = sensor_type["metrics"]
+
+    pattern = f"{prefix}_{agg_level}_*.csv"
+    fpaths = sorted(agg_dir.glob(pattern))
+
+    if not fpaths:
+        logger.info(f"no {agg_level} CSV files found in {agg_dir}")
+        return
+
+    dfs = []
+    for fpath in fpaths:
+        try:
+            df = pd.read_csv(fpath)
+            if df.empty:
+                continue
+            df["time"] = pd.to_datetime(df["time"])
+            df = df[df["time"].dt.date >= cutoff_date]
+            if not df.empty:
+                dfs.append(df)
+        except Exception as e:
+            logger.warning(f"skipping {fpath.name}: {e}")
+
+    if not dfs:
+        logger.info(f"no {agg_level} data within retention window for {prefix}")
+        return
+
+    df_all = pd.concat(dfs, ignore_index=True)
+    push_aggregate_redis(r, df_all, metrics, "location", agg_level)
+    logger.info(f"ingested {len(df_all)} {agg_level} records from CSV for {prefix}")
+
+
+def marker_backfill(r, sensor_type):
+    """Backfill missing aggregates using the marker-based approach."""
+    prefix = sensor_type["prefix"]
+    metrics = sensor_type["metrics"]
+    value_col_map = sensor_type["value_col_map"]
+    now = timestamp_now()
+
+    for agg_level, freq, agg_dir in [
+        ("hourly", "h", sensor_type["hourly_dir"]),
+        ("daily", "D", sensor_type["daily_dir"]),
+    ]:
+        retention_ms = AGGREGATIONS[agg_level]["retention"]
+        retention_td = datetime.timedelta(milliseconds=retention_ms)
+
+        last_time = get_last_aggregated_time(agg_dir, prefix, agg_level)
+
+        if last_time is not None:
+            if agg_level == "hourly":
+                start_date = (last_time + datetime.timedelta(hours=1)).date()
+            else:
+                start_date = (last_time + datetime.timedelta(days=1)).date()
+        else:
+            # fallback: recompute full retention window
+            start_date = (now - retention_td).date()
+            logger.info(f"no {agg_level} marker found for {prefix}, "
+                        f"backfilling from {start_date}")
+
+        if agg_level == "daily":
+            end_date = (now - datetime.timedelta(days=1)).date()
+        else:
+            end_date = now.date()
+
+        if start_date > end_date:
+            logger.info(f"no {agg_level} backfill needed for {prefix}")
+            continue
+
+        df_raw = load_raw_csvs(sensor_type["data_dir"], prefix,
+                               start_date, end_date, value_col_map)
+        if df_raw.empty:
+            logger.info(f"no raw data for {prefix} {agg_level} backfill "
+                        f"({start_date} to {end_date})")
+            continue
+
+        # filter to only completed periods
+        if agg_level == "hourly":
+            current_hour = now.replace(minute=0, second=0, microsecond=0)
+            df_raw = df_raw[df_raw["time"] < current_hour]
+        else:
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            df_raw = df_raw[df_raw["time"] < today]
+
+        if df_raw.empty:
+            continue
+
+        df_agg = compute_aggregates(df_raw, metrics, "location", freq)
+        if df_agg.empty:
+            continue
+
+        push_aggregate_redis(r, df_agg, metrics, "location", agg_level)
+        write_aggregate_csv(df_agg, agg_dir, prefix, agg_level)
+        logger.info(f"marker backfill {prefix} {agg_level}: "
+                    f"wrote {len(df_agg)} records ({start_date} to {end_date})")
+
+
 if __name__ == "__main__":
     logger.info(f"starting redis rehydration")
     r = get_redis()
@@ -99,8 +204,21 @@ if __name__ == "__main__":
 
     r.flushdb()
     create_schema(r)
-    df = ingest_raw(r, DATA_DIR_SHT,"sht")
+
+    # Step 1: ingest raw data (existing flow)
+    df = ingest_raw(r, DATA_DIR_SHT, "sht")
     push_raw_sht_data_redis(r, df)
 
     df_co2 = ingest_raw(r, DATA_DIR_CO2, "co2")
     push_raw_co2_data_redis(r, df_co2)
+
+    # Step 2: ingest aggregate CSVs into Redis
+    for type_name, sensor_type in SENSOR_TYPES.items():
+        ingest_aggregate_csvs(r, sensor_type, "hourly")
+        ingest_aggregate_csvs(r, sensor_type, "daily")
+
+    # Step 3: marker-based backfill for gaps
+    for type_name, sensor_type in SENSOR_TYPES.items():
+        marker_backfill(r, sensor_type)
+
+    logger.info("rehydration complete")
