@@ -87,6 +87,37 @@ def get_night_periods(x_values: List[datetime]) -> List[Tuple[datetime, datetime
     return periods
 
 
+# Break the line after 3+ missing data points (gap > 3.5 × nominal interval)
+GAP_THRESHOLD_MS = {
+    agg: int(v["interval_ms"] * 3.5)
+    for agg, v in AGGREGATIONS.items()
+}
+
+
+def insert_gap_nones(df: pd.DataFrame, max_gap_ms: int) -> pd.DataFrame:
+    """Insert a None row wherever consecutive timestamps exceed max_gap_ms.
+
+    Plotly breaks the line at None/NaN values (connectgaps=False is the default).
+    """
+    if df.empty or len(df) < 2:
+        return df
+    times = df["time"].tolist()
+    dts = df["datetime"].tolist()
+    vals = df["value"].tolist()
+
+    out_t, out_dt, out_v = [], [], []
+    for i, (t, dt, v) in enumerate(zip(times, dts, vals)):
+        if i > 0 and (t - times[i - 1]) > max_gap_ms:
+            out_t.append(times[i - 1] + 1)
+            out_dt.append(dts[i - 1] + datetime.timedelta(milliseconds=1))
+            out_v.append(None)
+        out_t.append(t)
+        out_dt.append(dt)
+        out_v.append(v)
+
+    return pd.DataFrame({"time": out_t, "datetime": out_dt, "value": out_v})
+
+
 def fetch_series_data(key: str) -> pd.DataFrame:
     """Fetch and return data from a RedisTimeSeries key as a DataFrame."""
     try:
@@ -111,6 +142,7 @@ def plot_lines_for(metric: str, agg: str) -> List[dict]:
             key = make_key(sensor, metric, agg)
             label = f"{sensor}"
             df = fetch_series_data(key)
+            df = insert_gap_nones(df, GAP_THRESHOLD_MS[agg])
             if not df.empty:
                 lines.append({
                     "x": df["datetime"],
@@ -123,6 +155,7 @@ def plot_lines_for(metric: str, agg: str) -> List[dict]:
             key = make_key(sensor, metric, agg)
             label = f"{sensor}"
             df = fetch_series_data(key)
+            df = insert_gap_nones(df, GAP_THRESHOLD_MS[agg])
             if not df.empty:
                 lines.append({
                     "x": df["datetime"],
@@ -212,17 +245,43 @@ def register_callbacks(app: Dash) -> None:
         for dm in DERIVED_METRICS:
             for agg in AGGREGATIONS:
                 if agg == "raw":
-                    key = make_key("derived", dm["name"], "raw")
-                    df = fetch_series_data(key)
-                    if not df.empty:
-                        lines = [{
-                            "x": df["datetime"],
-                            "y": df["value"],
-                            "type": "line",
-                            "name": dm["label"],
-                        }]
-                    else:
+                    if "series" in dm:
+                        # Multi-output: fetch each series and overlay on one graph
                         lines = []
+                        all_datetimes = []
+                        all_y = []
+                        for series_def in dm["series"]:
+                            key = make_key("derived", series_def["key"], "raw")
+                            df = fetch_series_data(key)
+                            df = insert_gap_nones(df, GAP_THRESHOLD_MS["raw"])
+                            if not df.empty:
+                                lines.append({
+                                    "x": df["datetime"],
+                                    "y": df["value"],
+                                    "type": "line",
+                                    "name": series_def["label"],
+                                    "line": series_def.get("line", {}),
+                                })
+                                all_datetimes.extend(df["datetime"].dropna().tolist())
+                                all_y.extend(v for v in df["value"] if v is not None)
+                    else:
+                        key = make_key("derived", dm["name"], "raw")
+                        df = fetch_series_data(key)
+                        df = insert_gap_nones(df, GAP_THRESHOLD_MS["raw"])
+                        if not df.empty:
+                            lines = [{
+                                "x": df["datetime"],
+                                "y": df["value"],
+                                "type": "line",
+                                "name": dm["label"],
+                            }]
+                            all_datetimes = list(df["datetime"])
+                            all_y = list(df["value"])
+                        else:
+                            lines = []
+                            all_datetimes = []
+                            all_y = []
+
                     fig = {
                         "data": lines,
                         "layout": {
@@ -235,13 +294,12 @@ def register_callbacks(app: Dash) -> None:
                         }
                     }
                     # night shading
-                    if lines:
-                        all_datetimes = list(df["datetime"])
-                        all_y = list(df["value"])
-                        if all_datetimes:
+                    if lines and all_datetimes:
+                        valid_y = [v for v in all_y if v is not None]
+                        if valid_y:
                             x_max = max(all_datetimes)
-                            y_min = min(all_y)
-                            y_max = max(all_y)
+                            y_min = min(valid_y)
+                            y_max = max(valid_y)
                             night_periods = get_night_periods(all_datetimes)
                             shapes = []
                             for start, end in night_periods:

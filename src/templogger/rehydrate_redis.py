@@ -62,20 +62,24 @@ def create_schema(r):
                     counter_ignore += 1
 
     for dm in DERIVED_METRICS:
-        key = make_key("derived", dm["name"], "raw")
-        try:
-            r.ts().create(
-                key,
-                retention_msecs=AGGREGATIONS["raw"]["retention"],
-                duplicate_policy="LAST",
-            )
-            logger.info(f"created key {key}")
-            counter_success += 1
-        except redis.ResponseError as e:
-            if "TSDB: key already exists" not in str(e):
-                raise
-            logger.info(f"key {key} already exists - skipping")
-            counter_ignore += 1
+        if "series" in dm:
+            keys_to_create = [make_key("derived", s["key"], "raw") for s in dm["series"]]
+        else:
+            keys_to_create = [make_key("derived", dm["name"], "raw")]
+        for key in keys_to_create:
+            try:
+                r.ts().create(
+                    key,
+                    retention_msecs=AGGREGATIONS["raw"]["retention"],
+                    duplicate_policy="LAST",
+                )
+                logger.info(f"created key {key}")
+                counter_success += 1
+            except redis.ResponseError as e:
+                if "TSDB: key already exists" not in str(e):
+                    raise
+                logger.info(f"key {key} already exists - skipping")
+                counter_ignore += 1
 
     try:
         r.set(REDIS_LAST_TEIMESTAMP_KEY, 0)
@@ -212,70 +216,202 @@ def marker_backfill(r, sensor_type):
                     f"wrote {len(df_agg)} records ({start_date} to {end_date})")
 
 
-def recompute_derived(r):
-    """Recompute all derived metrics from raw data in Redis."""
-    from templogger.derived import FUNC_REGISTRY
-
-    ts = r.ts()
-    for metric_def in DERIVED_METRICS:
-        func_name = metric_def["func"]
-        func = FUNC_REGISTRY.get(func_name)
-        if func is None:
-            logger.warning(f"unknown derived func: {func_name}")
+def _recompute_single(r, metric_def, ts, sensor_data, all_timestamps):
+    """Recompute a single-output derived metric (e.g. TempDelta) for all timestamps."""
+    name = metric_def["name"]
+    derived_key = make_key("derived", name, "raw")
+    count = 0
+    for timestamp_ms in sorted(all_timestamps):
+        indoor_values = [
+            sensor_data[s][timestamp_ms]
+            for s in metric_def["indoor_sensors"]
+            if timestamp_ms in sensor_data.get(s, {})
+        ]
+        outdoor_values = [
+            sensor_data[s][timestamp_ms]
+            for s in metric_def["outdoor_sensors"]
+            if timestamp_ms in sensor_data.get(s, {})
+        ]
+        if not indoor_values or not outdoor_values:
             continue
+        indoor_mean = sum(indoor_values) / len(indoor_values)
+        outdoor_val = min(outdoor_values)
+        delta = round(indoor_mean - outdoor_val, 2)
+        try:
+            ts.add(derived_key, timestamp_ms, float(delta))
+            count += 1
+        except redis.ResponseError as e:
+            if "TSDB: Timestamp is older than retention" not in str(e):
+                raise
+    logger.info(f"recomputed {count} derived {name} values")
 
-        name = metric_def["name"]
-        source_metric = metric_def["source_metric"]
-        all_sensors = metric_def["indoor_sensors"] + metric_def["outdoor_sensors"]
 
-        # fetch full time series for each involved sensor
-        sensor_data = {}
-        for sensor in all_sensors:
-            key = make_key(sensor, source_metric, "raw")
-            try:
-                data = ts.range(key, "-", "+")
-                sensor_data[sensor] = {int(t): v for t, v in data}
-            except redis.ResponseError:
-                sensor_data[sensor] = {}
+def _recompute_poly_smooth(r, metric_def, ts, sensor_ts, sensor_vals, sensor_data):
+    """Recompute polynomial-smoothed temperatures across the full raw history.
 
-        # collect all timestamps from indoor sensors
-        all_timestamps = set()
+    Uses a bisect-based sliding window to avoid O(N²) Redis round-trips.
+    """
+    import bisect
+    from templogger.derived import _poly_smooth, _apparent_temp
+
+    degree = metric_def.get("degree", 2)
+    window_ms = metric_def.get("window_min", 120) * 60 * 1000
+
+    # Fetch Humidity data for AT computation (exact timestamp lookups)
+    all_sensors = metric_def["indoor_sensors"] + metric_def["outdoor_sensors"]
+    sensor_humidity = {}  # {sensor: {timestamp_ms: value}}
+    for sensor in all_sensors:
+        hkey = make_key(sensor, "Humidity", "raw")
+        try:
+            hdata = ts.range(hkey, "-", "+")
+            sensor_humidity[sensor] = {int(t): v for t, v in hdata}
+        except redis.ResponseError:
+            sensor_humidity[sensor] = {}
+
+    # Collect all timestamps from indoor sensors
+    all_timestamps = set()
+    for sensor in metric_def["indoor_sensors"]:
+        all_timestamps.update(sensor_ts.get(sensor, []))
+
+    if not all_timestamps:
+        logger.info(f"no raw data for poly smooth metric {metric_def['name']}")
+        return
+
+    series_redis_keys = {
+        s["key"]: make_key("derived", s["key"], "raw")
+        for s in metric_def["series"]
+    }
+    counts = {k: 0 for k in series_redis_keys}
+
+    for timestamp_ms in sorted(all_timestamps):
+        window_start = timestamp_ms - window_ms
+
+        indoor_smoothed = []
         for sensor in metric_def["indoor_sensors"]:
-            all_timestamps.update(sensor_data.get(sensor, {}).keys())
+            ts_list = sensor_ts.get(sensor, [])
+            if not ts_list:
+                continue
+            lo = bisect.bisect_left(ts_list, window_start)
+            hi = bisect.bisect_right(ts_list, timestamp_ms)
+            t_slice = ts_list[lo:hi]
+            v_slice = sensor_vals[sensor][lo:hi]
+            if len(t_slice) < degree + 1:
+                continue
+            v = _poly_smooth(t_slice, v_slice, timestamp_ms, degree)
+            if v is not None:
+                indoor_smoothed.append(v)
 
-        if not all_timestamps:
-            logger.info(f"no raw data for derived metric {name}")
+        outdoor_smoothed = []
+        for sensor in metric_def["outdoor_sensors"]:
+            ts_list = sensor_ts.get(sensor, [])
+            if not ts_list:
+                continue
+            lo = bisect.bisect_left(ts_list, window_start)
+            hi = bisect.bisect_right(ts_list, timestamp_ms)
+            t_slice = ts_list[lo:hi]
+            v_slice = sensor_vals[sensor][lo:hi]
+            if len(t_slice) < degree + 1:
+                continue
+            v = _poly_smooth(t_slice, v_slice, timestamp_ms, degree)
+            if v is not None:
+                outdoor_smoothed.append(v)
+
+        if not indoor_smoothed or not outdoor_smoothed:
             continue
 
-        derived_key = make_key("derived", name, "raw")
-        count = 0
-        for timestamp_ms in sorted(all_timestamps):
-            indoor_values = [
-                sensor_data[s][timestamp_ms]
-                for s in metric_def["indoor_sensors"]
-                if timestamp_ms in sensor_data.get(s, {})
-            ]
-            outdoor_values = [
-                sensor_data[s][timestamp_ms]
-                for s in metric_def["outdoor_sensors"]
-                if timestamp_ms in sensor_data.get(s, {})
-            ]
+        result = {
+            "PolyTempIndoor": round(sum(indoor_smoothed) / len(indoor_smoothed), 2),
+            "PolyTempOutdoor": round(min(outdoor_smoothed), 2),
+        }
 
-            if not indoor_values or not outdoor_values:
+        # Raw values at exact timestamp for comparison series
+        indoor_raw = [
+            sensor_data[s][timestamp_ms]
+            for s in metric_def["indoor_sensors"]
+            if timestamp_ms in sensor_data.get(s, {})
+        ]
+        outdoor_raw = [
+            sensor_data[s][timestamp_ms]
+            for s in metric_def["outdoor_sensors"]
+            if timestamp_ms in sensor_data.get(s, {})
+        ]
+        if indoor_raw:
+            result["RawIndoorMean"] = round(sum(indoor_raw) / len(indoor_raw), 2)
+        if outdoor_raw:
+            result["RawOutdoor"] = round(min(outdoor_raw), 2)
+
+        # Apparent temperature
+        indoor_rh = [
+            sensor_humidity[s][timestamp_ms]
+            for s in metric_def["indoor_sensors"]
+            if timestamp_ms in sensor_humidity.get(s, {})
+        ]
+        outdoor_rh = [
+            sensor_humidity[s][timestamp_ms]
+            for s in metric_def["outdoor_sensors"]
+            if timestamp_ms in sensor_humidity.get(s, {})
+        ]
+        if indoor_raw and indoor_rh:
+            result["ApparentTempIndoor"] = round(
+                _apparent_temp(
+                    sum(indoor_raw) / len(indoor_raw),
+                    sum(indoor_rh) / len(indoor_rh),
+                    0.0,
+                ), 2)
+        if outdoor_raw and outdoor_rh:
+            result["ApparentTempVent"] = round(
+                _apparent_temp(min(outdoor_raw), min(outdoor_rh), 1.0), 2)
+
+        for series_def in metric_def["series"]:
+            key_name = series_def["key"]
+            val = result.get(key_name)
+            if val is None:
                 continue
-
-            indoor_mean = sum(indoor_values) / len(indoor_values)
-            outdoor_val = min(outdoor_values)
-            delta = round(indoor_mean - outdoor_val, 2)
-
             try:
-                ts.add(derived_key, timestamp_ms, float(delta))
-                count += 1
+                ts.add(series_redis_keys[key_name], timestamp_ms, float(val))
+                counts[key_name] += 1
             except redis.ResponseError as e:
                 if "TSDB: Timestamp is older than retention" not in str(e):
                     raise
 
-        logger.info(f"recomputed {count} derived {name} values")
+    for key_name, count in counts.items():
+        logger.info(f"recomputed {count} derived {key_name} values")
+
+
+def recompute_derived(r):
+    """Recompute all derived metrics from raw data in Redis."""
+    ts = r.ts()
+    for metric_def in DERIVED_METRICS:
+        source_metric = metric_def["source_metric"]
+        all_sensors = metric_def["indoor_sensors"] + metric_def["outdoor_sensors"]
+
+        # Fetch full time series for each involved sensor
+        sensor_data = {}   # {sensor: {timestamp_ms: value}}  — for simple delta
+        sensor_ts = {}     # {sensor: [timestamp_ms, ...]}     — for poly smooth
+        sensor_vals = {}   # {sensor: [value, ...]}            — for poly smooth
+        for sensor in all_sensors:
+            key = make_key(sensor, source_metric, "raw")
+            try:
+                data = ts.range(key, "-", "+")
+                pairs = [(int(t), v) for t, v in data]
+                sensor_data[sensor] = {t: v for t, v in pairs}
+                sensor_ts[sensor] = [t for t, _ in pairs]
+                sensor_vals[sensor] = [v for _, v in pairs]
+            except redis.ResponseError:
+                sensor_data[sensor] = {}
+                sensor_ts[sensor] = []
+                sensor_vals[sensor] = []
+
+        if "series" in metric_def:
+            _recompute_poly_smooth(r, metric_def, ts, sensor_ts, sensor_vals, sensor_data)
+        else:
+            all_timestamps = set()
+            for sensor in metric_def["indoor_sensors"]:
+                all_timestamps.update(sensor_data.get(sensor, {}).keys())
+            if not all_timestamps:
+                logger.info(f"no raw data for derived metric {metric_def['name']}")
+                continue
+            _recompute_single(r, metric_def, ts, sensor_data, all_timestamps)
 
 
 if __name__ == "__main__":
