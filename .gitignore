@@ -202,4 +202,6 @@ setup_venv.sh
 data/
 sample_results
 src/templogger/old/
-
+side_project/
+logs/
+claude*
