@@ -1,3 +1,5 @@
+# Dr-Nuke's Templogger
+
 This is a logger for the sensirion SHTX sensors on development boards
 https://sensirion.com/products/catalog/SHT4x-Smart-Gadget
 
@@ -6,6 +8,10 @@ Quick start:
 * in there, add your sensors with MACS and Names
 * adjust the list of bluetooth adapters
 * run the [Redis Stack Docker Container](https://hub.docker.com/r/redis/redis-stack)
+* use systemd services to run/ rehydrate redis, the collector and the dashboard app
+
+The Dashboard looks like
+![Dashboard](assets/dashboard.png)
 
 ## SHT43 boards with firmware >= v0.5.3 (2024-02-28): encryption & pairing
 
