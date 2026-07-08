@@ -69,12 +69,12 @@ class SensorTask:
         self.attempt += 1
         logger.info(
             f"[{padded_name(self.name)}] Attempt {self.attempt}/{MAX_RETRIES} via {adapter}, connecting...")
+        start = timestamp_now()
+        if OS == "linux":
+            client = BleakClient(self.mac, adapter=adapter)  # timeout=0.0
+        else:
+            client = BleakClient(self.mac)
         try:
-            start = timestamp_now()
-            if OS == "linux":
-                client = BleakClient(self.mac, adapter=adapter)  # timeout=0.0
-            else:
-                client = BleakClient(self.mac)
             try:
                 await asyncio.wait_for(client.connect(timeout=SENSOR_TIMEOUT), timeout=SENSOR_TIMEOUT + 1)
             except asyncio.TimeoutError as e:
@@ -94,7 +94,6 @@ class SensorTask:
                 else:
                     [self.errors.append(e) for e in errors]
                     await asyncio.sleep(1)  # brief pause before retry
-            await client.disconnect()
         except BleakDeviceNotFoundError as e:
             self.last_error = str(e)
             self.errors.append(e)
@@ -107,6 +106,9 @@ class SensorTask:
                 f"[{padded_name(self.name)}] Encountered unspecified error on {self.attempt} in line {exc_tb.tb_lineno} via {adapter}: {e}")
             self.errors.append(e)
             await asyncio.sleep(1)  # brief pause before retry
+        finally:
+            if client.is_connected:
+                await client.disconnect()
 
 
 # === ASYNC WORKER LOOP ===

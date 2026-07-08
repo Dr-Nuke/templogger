@@ -57,13 +57,17 @@ CHARACTERISTICS: Dict[str, tuple[str, Callable[[bytes], Any]]] = {
     "Temperature": ("00002235-b38d-4985-720e-0f993a68ee41", lambda b: round(struct.unpack("<f", b)[0], 2)),
 }
 
-# Bluetooth adapters, see hciconfig from cli. default only hci0, the onboard-adapter
+# Bluetooth adapters. Find yours with `hciconfig -a` and check the "Bus:"
+# field: USB dongles show "Bus: USB", the onboard chip shows "Bus: UART".
+# Don't assume the onboard chip's index by default (e.g. hci0) — its
+# enumeration order isn't guaranteed. The list below is just an example;
+# adjust it to match your own hardware.
 ADAPTERS = [
     "hci0",
     "hci1",
     "hci2",
     "hci3",
-    # "hci4", # system-bluetooth for RPI 04
+    "hci4",
 ]
 
 

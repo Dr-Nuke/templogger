@@ -205,3 +205,6 @@ src/templogger/old/
 side_project/
 logs/
 claude*
+.claude/
+
+test/test_logs/
